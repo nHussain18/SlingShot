@@ -5,7 +5,7 @@ import * as Haptics from "expo-haptics";
 import React from "react";
 import { StyleSheet, View, useWindowDimensions } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
-import { runOnJS, useDerivedValue, useFrameCallback, useSharedValue, withSpring } from "react-native-reanimated";
+import { runOnJS, useFrameCallback, useSharedValue, withSpring, withTiming } from "react-native-reanimated";
 
 const ANCHOR_INSET = 60;
 const FORK_HEIGHT = 120;
@@ -18,11 +18,17 @@ const GRAVITY = 950;
 const DRAG_COEFFICIENT = 0.0004;
 const MAX_PULL = 250;
 const DEFAULT_SAG = 25;
+const MAX_CONCURRENT_ROCKS = 8;
+const RELOAD_DELAY_MS = 1000; // 1.5 seconds gun-style reload delay
 
 const RESET_SPRING_CONFIG = { damping: 20, stiffness: 120, mass: 1 };
 const SNAP_SPRING_CONFIG = { damping: 6, stiffness: 450, mass: 0.35 };
 
-export default function Index() {
+interface ProjectileData {
+  id: number; x: number; y: number; rot: number; vx: number; vy: number; active: boolean; av: number;
+}
+
+const Catapult: React.FC = () => {
   const { width: canvasWidth, height: canvasHeight } = useWindowDimensions();
 
   const anchorY = canvasHeight * 0.6;
@@ -33,68 +39,81 @@ export default function Index() {
 
   const pullX = useSharedValue(restX);
   const pullY = useSharedValue(restY);
-  const projX = useSharedValue(restX);
-  const projY = useSharedValue(restY);
-  const projVx = useSharedValue(0);
-  const projVy = useSharedValue(0);
-  const projRotation = useSharedValue(0);
-  const angularVelocity = useSharedValue(0);
 
-  const isLaunched = useSharedValue(false);
+  const projectiles = useSharedValue<ProjectileData[]>(
+    Array.from({ length: MAX_CONCURRENT_ROCKS }, (_, i) => ({
+      id: i, x: 0, y: 0, rot: 0, vx: 0, vy: 0, av: 0, active: false
+    }))
+  );
+
   const isDraggingStone = useSharedValue(false);
   const launchThresholdReached = useSharedValue(false);
+
+  // ── RELOADING CORE MECHANICS ──────────────────────────────────────────────
+  const isReloading = useSharedValue(false);
+  const rockLoadingOpacity = useSharedValue(1);
+  const reloadProgress = useSharedValue(0);
 
   const triggerSelectionHaptic = () => Haptics.selectionAsync();
   const triggerImpactHaptic = () => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
   const triggerSuccessHaptic = () => Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 
-  const resetProjectile = () => {
-    "worklet";
-    projX.value = restX; projY.value = restY;
-    pullX.value = restX; pullY.value = restY;
-    projVx.value = 0; projVy.value = 0;
-    projRotation.value = 0; angularVelocity.value = 0;
-    isLaunched.value = false; isDraggingStone.value = false;
+  // Safely transitions states on the main JS execution loop
+  const executeReloadSequence = () => {
+    reloadProgress.value = 0;
+    reloadProgress.value = withTiming(1, { duration: RELOAD_DELAY_MS });
+    setTimeout(() => {
+      // Snappy fade-in effect when bullet chamber resets
+      rockLoadingOpacity.value = withTiming(1, { duration: 250 });
+      isReloading.value = false;
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); // Double crisp mechanical reloaded feel click
+    }, RELOAD_DELAY_MS);
   };
 
   useFrameCallback((frameInfo) => {
-    if (!isLaunched.value) return;
     const dt = Math.min((frameInfo.timeSincePreviousFrame ?? 16.6) / 1000, 0.03);
-    const speed = Math.hypot(projVx.value, projVy.value);
 
-    if (speed > 0.1) {
-      projVx.value -= DRAG_COEFFICIENT * speed * projVx.value * dt;
-      projVy.value -= DRAG_COEFFICIENT * speed * projVy.value * dt;
-    }
-    projVy.value += GRAVITY * dt;
-    projX.value += projVx.value * dt;
-    projY.value += projVy.value * dt;
-    projRotation.value += angularVelocity.value * dt;
+    const updatedPool = projectiles.value.map((rock) => {
+      if (!rock.active) return rock;
 
-    if (
-      projY.value > canvasHeight + PROJECTILE_RADIUS * 2 ||
-      projX.value < -PROJECTILE_RADIUS * 2 ||
-      projX.value > canvasWidth + PROJECTILE_RADIUS * 2
-    ) {
-      resetProjectile();
-    }
+      let vx = rock.vx; let vy = rock.vy;
+      const speed = Math.hypot(vx, vy);
+
+      if (speed > 0.1) {
+        vx -= DRAG_COEFFICIENT * speed * vx * dt;
+        vy -= DRAG_COEFFICIENT * speed * vy * dt;
+      }
+      vy += GRAVITY * dt;
+
+      const nextX = rock.x + vx * dt;
+      const nextY = rock.y + vy * dt;
+      const nextRot = rock.rot + rock.av * dt;
+
+      if (nextY > canvasHeight + 100 || nextX < -100 || nextX > canvasWidth + 100) {
+        return { ...rock, active: false };
+      }
+      return { ...rock, x: nextX, y: nextY, vx, vy, rot: nextRot };
+    });
+
+    projectiles.value = updatedPool;
   });
 
   const panGesture = Gesture.Pan()
     .onBegin((e) => {
-      if (isLaunched.value) return;
-      if (Math.hypot(e.x - projX.value, e.y - projY.value) <= 55) {
+      // CRITICAL LOCKOUT: Ignore interaction entirely if chamber is empty reloading
+      if (isReloading.value) return;
+
+      if (Math.hypot(e.x - pullX.value, e.y - pullY.value) <= 55) {
         isDraggingStone.value = true;
         runOnJS(triggerSelectionHaptic)();
       }
     })
     .onUpdate((e) => {
-      if (isLaunched.value || !isDraggingStone.value) return;
+      if (!isDraggingStone.value || isReloading.value) return;
 
-      let dx = e.translationX;
-      let dy = e.translationY;
-
+      let dx = e.translationX; let dy = e.translationY;
       const currentPullDist = Math.hypot(dx, dy);
+
       if (currentPullDist > MAX_PULL) {
         const angle = Math.atan2(dy, dx);
         dx = Math.cos(angle) * MAX_PULL;
@@ -109,68 +128,62 @@ export default function Index() {
       }
 
       pullX.value = restX + dx; pullY.value = restY + dy;
-      projX.value = restX + dx; projY.value = restY + dy;
     })
     .onEnd(() => {
-      if (isLaunched.value || !isDraggingStone.value) return;
+      if (!isDraggingStone.value || isReloading.value) return;
       const dx = restX - pullX.value; const dy = restY - pullY.value;
       const pullDistance = Math.hypot(dx, dy);
       launchThresholdReached.value = false;
 
       if (pullDistance > 28) {
+        const velocityMultiplier = pullDistance / 14;
+        const poolCopy = [...projectiles.value];
+        const freeSlotIndex = poolCopy.findIndex((r) => !r.active);
+
+        if (freeSlotIndex !== -1) {
+          poolCopy[freeSlotIndex] = {
+            id: freeSlotIndex,
+            x: pullX.value,
+            y: pullY.value,
+            vx: dx * velocityMultiplier,
+            vy: dy * velocityMultiplier,
+            rot: 0,
+            av: (dx >= 0 ? 1 : -1) * (pullDistance * 0.07),
+            active: true,
+          };
+          projectiles.value = poolCopy;
+        }
+
+        // TRIGGER CHAMBER EMPTY RELOAD STATE
+        isReloading.value = true;
+        rockLoadingOpacity.value = 0; // Staging chamber rock vanishes instantly on release
+        runOnJS(executeReloadSequence)();
+
         pullX.value = withSpring(restX, SNAP_SPRING_CONFIG);
         pullY.value = withSpring(restY, SNAP_SPRING_CONFIG);
-
-        const velocityMultiplier = pullDistance / 14;
-        projVx.value = dx * velocityMultiplier;
-        projVy.value = dy * velocityMultiplier;
-        angularVelocity.value = (dx >= 0 ? 1 : -1) * (pullDistance * 0.07);
-        isLaunched.value = true;
+        isDraggingStone.value = false;
         runOnJS(triggerSuccessHaptic)();
       } else {
         pullX.value = withSpring(restX, RESET_SPRING_CONFIG);
         pullY.value = withSpring(restY, RESET_SPRING_CONFIG);
-        projX.value = withSpring(restX, RESET_SPRING_CONFIG);
-        projY.value = withSpring(restY, RESET_SPRING_CONFIG);
         isDraggingStone.value = false;
         runOnJS(triggerSelectionHaptic)();
       }
     });
 
-  const projectileBlur = useDerivedValue(() => {
-    if (!isLaunched.value) return 0;
-    const speed = Math.hypot(projVx.value, projVy.value);
-    return speed < 300 ? 0 : Math.min((speed - 300) / 800, 1) * 6;
-  });
-
-  // ── BACKGROUND PRINITIVES ──────────────────────────────────────────────────
   const skyBackgroundPath = Skia.Path.Make().addRect(Skia.XYWHRect(0, 0, canvasWidth, canvasHeight));
-
-  // Distant Soft Mountain Range Path
   const mountainsPath = React.useMemo(() => {
-    const path = Skia.Path.Make();
-    const midY = canvasHeight * 0.62;
-    path.moveTo(0, canvasHeight);
-    path.lineTo(0, midY);
-    path.lineTo(canvasWidth * 0.25, midY - 40);
-    path.lineTo(canvasWidth * 0.5, midY + 10);
-    path.lineTo(canvasWidth * 0.75, midY - 60);
-    path.lineTo(canvasWidth, midY - 10);
-    path.lineTo(canvasWidth, canvasHeight);
-    path.close();
-    return path;
+    const path = Skia.Path.Make(); const midY = canvasHeight * 0.62;
+    path.moveTo(0, canvasHeight).lineTo(0, midY).lineTo(canvasWidth * 0.25, midY - 40).lineTo(canvasWidth * 0.5, midY + 10);
+    path.lineTo(canvasWidth * 0.75, midY - 60).lineTo(canvasWidth, midY - 10).lineTo(canvasWidth, canvasHeight);
+    path.close(); return path;
   }, [canvasWidth, canvasHeight]);
 
-  // Closer Ground Hill Path sitting right under the base of the stick
   const groundPath = React.useMemo(() => {
-    const path = Skia.Path.Make();
-    const groundY = anchorY + FORK_HEIGHT - 5;
-    path.moveTo(0, canvasHeight);
-    path.lineTo(0, groundY + 15);
-    path.quadTo(canvasWidth / 2, groundY - 10, canvasWidth, groundY + 20);
-    path.lineTo(canvasWidth, canvasHeight);
-    path.close();
-    return path;
+    const path = Skia.Path.Make(); const groundY = anchorY + FORK_HEIGHT - 5;
+    path.moveTo(0, canvasHeight).lineTo(0, groundY + 15);
+    path.quadTo(canvasWidth / 2, groundY - 10, canvasWidth, groundY + 20).lineTo(canvasWidth, canvasHeight);
+    path.close(); return path;
   }, [canvasWidth, canvasHeight, anchorY]);
 
   return (
@@ -178,49 +191,39 @@ export default function Index() {
       <GestureDetector gesture={panGesture}>
         <View style={styles.canvasWrapper}>
           <Canvas style={styles.canvas}>
-            {/* 1. SKY GRADIENT */}
             <Path path={skyBackgroundPath} style="fill">
-              <LinearGradient
-                start={vec(0, 0)}
-                end={vec(0, canvasHeight)}
-                colors={["#7BB6E7", "#B9E0FF", "#E8F0FE"]} // Deep blue down to horizon morning atmospheric glow
-              />
+              <LinearGradient start={vec(0, 0)} end={vec(0, canvasHeight)} colors={["#7BB6E7", "#B9E0FF", "#E8F0FE"]} />
             </Path>
-
-            {/* 2. DISTANT SILHOUETTE MOUNTAINS */}
             <Path path={mountainsPath} color="#A2BCE0" style="fill" opacity={0.65} />
-
-            {/* 3. EARTH SURFACE HILL LAYER */}
             <Path path={groundPath} style="fill">
-              <LinearGradient
-                start={vec(0, anchorY)}
-                end={vec(0, canvasHeight)}
-                colors={["#93A287", "#738268"]} // Muted grass green down to mossy forest ground tones
-              />
+              <LinearGradient start={vec(0, anchorY)} end={vec(0, canvasHeight)} colors={["#93A287", "#738268"]} />
             </Path>
 
-            {/* 4. ACTIVE GAMEPLAY OVERLAYS */}
             <SlingshotRigging
-
               pullX={pullX} pullY={pullY}
               leftAnchorX={leftAnchorX} rightAnchorX={rightAnchorX} restY={anchorY}
               canvasWidth={canvasWidth} anchorY={anchorY} forkHeight={FORK_HEIGHT}
               baseWidth={BASE_WIDTH} pouchWidth={POUCH_WIDTH} pouchHeight={POUCH_HEIGHT}
+              reloadProgress={reloadProgress}
+              isReloading={isReloading}
             />
+
             <RockProjectile
-              projX={projX} projY={projY}
-              projRotation={projRotation}
-              projectileBlur={projectileBlur}
+              pullX={pullX} pullY={pullY}
+              projectiles={projectiles}
+              rockLoadingOpacity={rockLoadingOpacity} // Pass the reload fade value forward
             />
           </Canvas>
         </View>
       </GestureDetector>
     </View>
   );
-}
+};
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#B9E0FF" },
   canvasWrapper: { flex: 1 },
   canvas: { flex: 1 },
 });
+
+export default Catapult;

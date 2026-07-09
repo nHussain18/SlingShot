@@ -17,10 +17,12 @@ interface SlingshotRiggingProps {
   baseWidth: number;
   pouchWidth: number;
   pouchHeight: number;
+  reloadProgress: SharedValue<number>;
+  isReloading: SharedValue<boolean>;
 }
 
 export const SlingshotRigging: React.FC<SlingshotRiggingProps> = ({
-  pullX, pullY, leftAnchorX, rightAnchorX, restY, canvasWidth, anchorY, forkHeight, baseWidth, pouchWidth, pouchHeight
+  pullX, pullY, leftAnchorX, rightAnchorX, restY, canvasWidth, anchorY, forkHeight, baseWidth, pouchWidth, pouchHeight, reloadProgress, isReloading
 }) => {
   const restX = canvasWidth / 2;
   const DEFAULT_REST_Y = restY + 25;
@@ -150,6 +152,12 @@ export const SlingshotRigging: React.FC<SlingshotRiggingProps> = ({
     return path;
   });
 
+  const loaderCirclePath = React.useMemo(() => {
+    const path = Skia.Path.Make();
+    path.addCircle(restX, DEFAULT_REST_Y, 18);
+    return path;
+  }, [restX, DEFAULT_REST_Y]);
+
   // Muted organic bark environment lighting vector parameters
   const woodGradStart = vec(canvasWidth / 2, anchorY);
   const woodGradEnd = vec(canvasWidth / 2, anchorY + forkHeight);
@@ -239,6 +247,24 @@ export const SlingshotRigging: React.FC<SlingshotRiggingProps> = ({
         pullX={pullX}
         pullY={pullY}
         pouchWidth={pouchWidth}
+      />
+      <Path
+        opacity={useDerivedValue(() => (isReloading.value ? 1 : 0))}
+        matrix={useDerivedValue(() => {
+          const matrix = Skia.Matrix();
+          // Move origin to pouch center, rotate -90 degrees, translate back
+          matrix.translate(restX, DEFAULT_REST_Y);
+          matrix.rotate(-Math.PI / 2);
+          matrix.translate(-restX, -DEFAULT_REST_Y);
+          return matrix;
+        })}
+        path={loaderCirclePath}
+        color="#EE6600" // Vibrant dark amber accent 
+        style="stroke"
+        strokeWidth={2.5}
+        strokeCap="round"
+        end={1}             // Keep the end locked at the tail
+        start={reloadProgress} // Animating start from 0 -> 1 smoothly drains the circle away clockwise!
       />
     </>
   );
